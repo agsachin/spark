@@ -17,6 +17,7 @@
 
 package org.apache.spark.streaming.dstream
 
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.{PartitionerAwareUnionRDD, RDD, UnionRDD}
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.streaming.{Duration, Interval, Time}
@@ -43,37 +44,73 @@ object PatternMatchedDStream {
   }
 }
 
-case class WindowMetric(first: Any, prev: Any) {}
+case class WindowState(first: Any, prev: Any) {}
 
 private[streaming]
 class PatternMatchedDStream[T: ClassTag](
-                                      parent: DStream[T],
-                                      pattern: scala.util.matching.Regex,
-                                      predicates: Map[String, (T, WindowMetric) => Boolean],
-                                      _windowDuration: Duration,
-                                      _slideDuration: Duration,
-                                      partitioner: Partitioner
-                                      ) extends DStream[List[T]](parent.ssc) {
+    parent: DStream[T],
+    pattern: scala.util.matching.Regex,
+    predicates: Map[String, (T, WindowState) => Boolean],
+    _windowDuration: Duration,
+    _slideDuration: Duration
+    ) extends DStream[List[T]](parent.ssc) {
 
   require(_windowDuration.isMultipleOf(parent.slideDuration),
-    "The window duration of ReducedWindowedDStream (" + _windowDuration + ") " +
+    "The window duration of PatternMatchedDStream (" + _windowDuration + ") " +
       "must be multiple of the slide duration of parent DStream (" + parent.slideDuration + ")"
   )
 
   require(_slideDuration.isMultipleOf(parent.slideDuration),
-    "The slide duration of ReducedWindowedDStream (" + _slideDuration + ") " +
+    "The slide duration of PatternMatchedDStream (" + _slideDuration + ") " +
       "must be multiple of the slide duration of parent DStream (" + parent.slideDuration + ")"
   )
 
+  private def maxTStream(in: DStream[(Long, (T, Option[T]))]) : DStream[(Long, T)] = {
+    in.reduce((e1, e2) => {
+      if (e1._1 > e2._1) {
+        e1
+      } else {
+        e2
+      }
+    }).map(max => (max._1, max._2._1))
+  }
+
+  private def keyWithPreviousEvent(in: DStream[T]) : DStream[(Long, (T, Option[T]))] = {
+    val keyedRdd = in.transform((rdd, time) => {
+      val offset = System.nanoTime()
+      rdd.zipWithIndex().map(i => {
+        (i._2 + offset, i._1)})
+    })
+    val previousEventRdd = keyedRdd.map(x => (x._1 + 1, x._2) )
+    keyedRdd.leftOuterJoin(previousEventRdd).transform(rdd => {rdd.sortByKey()} )
+  }
+
+  val sortedprevMappedStream = keyWithPreviousEvent(parent)
+  val maxKeyStream = maxTStream(sortedprevMappedStream)
+
   super.persist(StorageLevel.MEMORY_ONLY_SER)
+  sortedprevMappedStream.persist(StorageLevel.MEMORY_ONLY_SER)
+  maxKeyStream.persist(StorageLevel.MEMORY_ONLY_SER)
 
   def windowDuration: Duration = _windowDuration
 
-  override def dependencies: List[DStream[_]] = List(parent)
+  override def dependencies: List[DStream[_]] = List(sortedprevMappedStream, maxKeyStream)
 
   override def slideDuration: Duration = _slideDuration
 
   override val mustCheckpoint = true
+
+  override def persist(storageLevel: StorageLevel): DStream[List[T]] = {
+    super.persist(storageLevel)
+    sortedprevMappedStream.persist(storageLevel)
+    maxKeyStream.persist(storageLevel)
+    this
+  }
+
+  override def checkpoint(interval: Duration): DStream[List[T]] = {
+    super.checkpoint(interval)
+    this
+  }
 
   override def parentRememberDuration: Duration = rememberDuration + windowDuration
 
@@ -85,7 +122,7 @@ class PatternMatchedDStream[T: ClassTag](
       .map(x => {
         val it = x.iterator
         val builder = new scala.collection.mutable.StringBuilder()
-        val map = scala.collection.mutable.HashMap[Long, Tuple2[Long,T]] ()
+        val map = scala.collection.mutable.HashMap[Long, Tuple2[Long, T]] ()
         var curLen = 1L
         while (it.hasNext) {
           val i = it.next()
@@ -93,7 +130,6 @@ class PatternMatchedDStream[T: ClassTag](
           map.put(curLen, (i._1, i._2._2))
           curLen += i._2._1.length + 1
         }
-        //println(builder.toString(), map)
         (builder.toString(), map)
       })
     val tracker = PatternMatchedDStream.getInstance(this.ssc.sparkContext)
@@ -108,7 +144,6 @@ class PatternMatchedDStream[T: ClassTag](
         one.split(" ").map(sub => {
           val id = y._2.get(it.start + len)
           list += id.get._2
-          //println("id="+id.get._1)
           if (tracker.toString.toLong < id.get._1) {
             tracker.setValue(id.get._1)
           }
@@ -116,9 +151,19 @@ class PatternMatchedDStream[T: ClassTag](
         })
         o += list.toList
       }
-      // o.toList.foreach(println)
       o.toList
     })
+  }
+
+  private def getLastMaxKey(rdds: Seq[RDD[(Long, T)]]): Option[T] = {
+    if (rdds.length > 0) {
+      (0 to rdds.size-1).map(i => {
+        if (!rdds(rdds.size-1-i).isEmpty()) {
+          return Some(rdds(rdds.size-1-i).reduce((e1, e2) => { if (e1._1 > e2._1) e1 else e2 })._2)
+        }
+      })
+    }
+    None: Option[T]
   }
 
   override def compute(validTime: Time): Option[RDD[List[T]]] = {
@@ -127,22 +172,12 @@ class PatternMatchedDStream[T: ClassTag](
     val currentWindow = new Interval(validTime - windowDuration + parent.slideDuration, validTime)
     val previousWindow = currentWindow - slideDuration
 
-    val tracker = PatternMatchedDStream.getInstance(this.ssc.sparkContext)
 
-    val oldRDDs =
-      parent.slice(previousWindow.beginTime, currentWindow.beginTime - parent.slideDuration)
+    // first get the row with max key in the last window and broadcast it
+    val oldMaxStreamRDDs = maxKeyStream.slice(previousWindow)
+    val brdcst = ssc.sparkContext.broadcast(getLastMaxKey(oldMaxStreamRDDs))
 
-    val oldRDD = if (oldRDDs.flatMap(_.partitioner).distinct.length == 1) {
-      logDebug("Using partition aware union for windowing at " + validTime)
-      new PartitionerAwareUnionRDD(ssc.sc, oldRDDs)
-    } else {
-      logDebug("Using normal union for windowing at " + validTime)
-      new UnionRDD(ssc.sc, oldRDDs)
-    }
-
-    val increment = oldRDD.count()
-
-    val rddsInWindow = parent.slice(currentWindow)
+    val rddsInWindow = sortedprevMappedStream.slice(currentWindow)
     val windowRDD = if (rddsInWindow.flatMap(_.partitioner).distinct.length == 1) {
       logDebug("Using partition aware union for windowing at " + validTime)
       new PartitionerAwareUnionRDD(ssc.sc, rddsInWindow)
@@ -152,39 +187,48 @@ class PatternMatchedDStream[T: ClassTag](
     }
 
     if (!windowRDD.isEmpty()) {
-      //println(windowRDD.count)
-      val first = windowRDD.first()
-      var shift = 0L
-      if (tracker.toString.toLong > 0L) {
-        shift = tracker.toString.toLong - increment
+
+      // we dont want to report old matched patterns in current window if any
+      // so skip to the ID maintained in tracker
+      val tracker = PatternMatchedDStream.getInstance(this.ssc.sparkContext)
+      val shift = if (tracker.toString.toLong > 0L) {
+        val copy = tracker.toString.toLong
         tracker.setValue(0L)
+        copy
+      } else {
+        0L
       }
+      val newRDD = windowRDD.filter(x => x._1 > shift)
 
-      val zippedRDD = windowRDD.zipWithIndex().map(x => (x._2, x._1)).sortByKey()
-      val selectedRDD = zippedRDD.filter(x => x._1 > shift)
-
-      val prevKeyRdd = selectedRDD.map(i => {
-        (i._1 + 1, i._2)
-      })
-
-      val sortedprevMappedRdd = selectedRDD.leftOuterJoin(prevKeyRdd).sortByKey()
-
-      val taggedRDD = sortedprevMappedRdd.map(x => {
+      val first = newRDD.first()
+      val taggedRDD = newRDD.map(x => {
         var isMatch = false
         var matchName = "NAN"
         for (predicate <- predicatesCopy if !isMatch) {
-          isMatch = predicate._2(x._2._1, WindowMetric(first, x._2._2.getOrElse(first)))
+          val prev = x._2._2 match {
+            case Some(i) => i.asInstanceOf[T]
+            case None => {
+              if (first._1 == x._1) { // this is the first in window
+                first._2._1
+              }
+              else { // this is a batchInterval boundary
+                brdcst.value.get
+              }
+            }
+          }
+          isMatch = predicate._2(x._2._1, WindowState(first._2._1, x._2._2.getOrElse(prev)))
           if (isMatch) {
             matchName = predicate._1
           }
         }
-        // println(x._1, (matchName, x._2._1))
         (x._1, (matchName, x._2._1))
       })
 
       Some(applyRegex(taggedRDD))
     }
-    else
+    else {
       None
+    }
   }
 }
+
