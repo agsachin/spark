@@ -34,6 +34,7 @@ import org.apache.spark.streaming.Time
 @DeveloperApi
 case class BatchInfo(
     batchTime: Time,
+    jobSetCreationDelay: Option[Long],
     streamIdToInputInfo: Map[Int, StreamInputInfo],
     submissionTime: Long,
     processingStartTime: Option[Long],
@@ -43,6 +44,8 @@ case class BatchInfo(
 
   @deprecated("Use streamIdToInputInfo instead", "1.5.0")
   def streamIdToNumRecords: Map[Int, Long] = streamIdToInputInfo.mapValues(_.numRecords)
+
+  def batchJobSetCreationDelay = jobSetCreationDelay.getOrElse(0L)
 
   /**
    * Time taken for the first job of this batch to start processing from the time this batch

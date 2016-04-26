@@ -17,11 +17,9 @@
 
 package org.apache.spark.streaming.scheduler
 
-import scala.collection.mutable.HashSet
-import scala.util.Failure
-
 import org.apache.spark.streaming.Time
-import org.apache.spark.util.Utils
+
+import scala.collection.mutable.HashSet
 
 /** Class representing a set of Jobs
   * belong to the same batch.
@@ -29,6 +27,7 @@ import org.apache.spark.util.Utils
 private[streaming]
 case class JobSet(
     time: Time,
+    jobSetCreationDelay: Option[Long],
     jobs: Seq[Job],
     streamIdToInputInfo: Map[Int, StreamInputInfo] = Map.empty) {
 
@@ -66,6 +65,7 @@ case class JobSet(
   def toBatchInfo: BatchInfo = {
     BatchInfo(
       time,
+      jobSetCreationDelay,
       streamIdToInputInfo,
       submissionTime,
       if (processingStartTime >= 0) Some(processingStartTime) else None,
