@@ -229,7 +229,7 @@ class JobGenerator(jobScheduler: JobScheduler) extends Logging {
       // added but not allocated, are dangling in the queue after recovering, we have to allocate
       // those blocks to the next batch, which is the batch they were supposed to go.
       jobScheduler.receiverTracker.allocateBlocksToBatch(time) // allocate received blocks to batch
-      jobScheduler.submitJobSet(JobSet(time, None, graph.generateJobs(time)))
+      jobScheduler.submitJobSet(JobSet(time, None, None,  graph.generateJobs(time)))
     }
 
     // Restart the timer
@@ -252,7 +252,7 @@ class JobGenerator(jobScheduler: JobScheduler) extends Logging {
       case Success(jobs) =>
         val jobSetCreationEndTime=clock.getTimeMillis()
         val streamIdToInputInfos = jobScheduler.inputInfoTracker.getInfo(time)
-        jobScheduler.submitJobSet(JobSet(time, Option(jobSetCreationEndTime-jobSetCreationStartTime), jobs, streamIdToInputInfos))
+        jobScheduler.submitJobSet(JobSet(time, Option(jobSetCreationStartTime),Option(jobSetCreationEndTime), jobs, streamIdToInputInfos))
       case Failure(e) =>
         jobScheduler.reportError("Error generating jobs for time " + time, e)
     }

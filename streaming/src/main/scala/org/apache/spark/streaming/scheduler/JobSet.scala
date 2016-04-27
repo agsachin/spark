@@ -27,7 +27,8 @@ import scala.collection.mutable.HashSet
 private[streaming]
 case class JobSet(
     time: Time,
-    jobSetCreationDelay: Option[Long],
+    jobSetCreationStartTime: Option[Long],
+    jobSetCreationEndTime: Option[Long],
     jobs: Seq[Job],
     streamIdToInputInfo: Map[Int, StreamInputInfo] = Map.empty) {
 
@@ -62,10 +63,12 @@ case class JobSet(
     processingEndTime - time.milliseconds
   }
 
+
   def toBatchInfo: BatchInfo = {
     BatchInfo(
       time,
-      jobSetCreationDelay,
+      jobSetCreationStartTime: Option[Long],
+      jobSetCreationEndTime: Option[Long],
       streamIdToInputInfo,
       submissionTime,
       if (processingStartTime >= 0) Some(processingStartTime) else None,
